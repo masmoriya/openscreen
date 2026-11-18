@@ -26,7 +26,7 @@ jobs:
     steps:
       - name: Sync PR activity to Discord forum thread
         id: sync
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_PR_FORUM_WEBHOOK: ${{ secrets.DISCORD_PR_FORUM_WEBHOOK }}
@@ -40,7 +40,9 @@ jobs:
             const WEBHOOK_USERNAME = (process.env.DISCORD_WEBHOOK_USERNAME || "OpenScreen").trim();
             const WEBHOOK_AVATAR = (process.env.DISCORD_WEBHOOK_AVATAR_URL || "").trim();
 
-            const THREAD_MARKER_REGEX = /<!--\s*discord-thread-id:(\d+)\s*-->/i;
+            const LEGACY_THREAD_MARKER = /<!--\s*discord-thread-id:(\d+)\s*-->/i;
+            const PENDING_THREAD_MAPPING = "Discord thread link pending.";
+            const THREAD_MAPPING_PATTERN = /^Linked to the Discord thread\.\n\n<!-- openscreen-discord-thread:(\d{17,20}) -->$/;
             const webhookUrl = (process.env.DISCORD_WEBHOOK_URL || process.env.DISCORD_PR_FORUM_WEBHOOK || "").trim();
             const botToken = (process.env.DISCORD_BOT_TOKEN || "").trim();
             const reviewerRoleId = (process.env.DISCORD_REVIEWER_ROLE_ID || "").trim();
@@ -76,15 +78,14 @@ jobs:
               return name.length > 95 ? name.slice(0, 95) : name;
             }
 
-            function extractThreadId(body) {
-              if (!body) return null;
-              const match = body.match(THREAD_MARKER_REGEX);
-              return match ? match[1] : null;
-            }
-
-            function upsertThreadMarker(body, threadId) {
-              const cleaned = (body || "").replace(THREAD_MARKER_REGEX, "").trim();
-              return `${cleaned}\n\n<!-- discord-thread-id:${threadId} -->`.trim();
+            function selectThreadMapping(comments) {
+              const mappings = comments.filter((comment) =>
+                comment.user?.type === "Bot" &&
+                comment.user.login === "github-actions[bot]" &&
+                (comment.body === PENDING_THREAD_MAPPING || THREAD_MAPPING_PATTERN.test(comment.body || ""))
+              );
+              if (mappings.length > 1) throw new Error("Multiple Discord thread mappings need reconciliation.");
+              return mappings[0] || null;
             }
 
             async function discordPost(payload, options = {}) {
@@ -238,7 +239,15 @@ jobs:
               const body = (pr.body || "").trim();
               const reviewState = await getReviewState(owner, repo, number);
 
-              let threadId = extractThreadId(body);
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: number, per_page: 100,
+              });
+              const mapping = selectThreadMapping(comments);
+              const threadId = mapping?.body.match(THREAD_MAPPING_PATTERN)?.[1];
+              if (!threadId && (mapping || LEGACY_THREAD_MARKER.test(body))) {
+                core.warning("Discord thread mapping needs maintainer reconciliation.");
+                return;
+              }
               const shouldCreateThread =
                 context.eventName === "pull_request_target" &&
                 ["opened", "reopened", "ready_for_review"].includes(action) &&
@@ -288,15 +297,19 @@ jobs:
                   ],
                 };
 
+                const { data: pending } = await github.rest.issues.createComment({
+                  owner, repo, issue_number: number, body: PENDING_THREAD_MAPPING,
+                });
                 const result = await discordPost(createPayload);
-                const createdThreadId = result.channel_id || null;
-                if (createdThreadId) {
-                  const updatedBody = upsertThreadMarker(body, createdThreadId);
-                  await github.rest.pulls.update({ owner, repo, pull_number: number, body: updatedBody });
-                  core.info(`Created Discord thread ${createdThreadId} and stored mapping.`);
-                } else {
-                  core.warning("Discord thread created but channel_id missing in response.");
+                const createdThreadId = result.channel_id;
+                if (typeof createdThreadId !== "string" || !/^\d{17,20}$/.test(createdThreadId)) {
+                  throw new Error("Discord creation did not return a thread ID. Reconcile the pending mapping.");
                 }
+                await github.rest.issues.updateComment({
+                  owner, repo, comment_id: pending.id,
+                  body: `Linked to the Discord thread.\n\n<!-- openscreen-discord-thread:${createdThreadId} -->`,
+                });
+                core.info("Created Discord thread and stored mapping.");
                 return;
               }
 
@@ -447,7 +460,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Post weekly contributor leaderboard
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           DISCORD_SPOTLIGHT_WEBHOOK_URL: ${{ secrets.DISCORD_SPOTLIGHT_WEBHOOK_URL }}
           DISCORD_WEBHOOK_USERNAME: ${{ secrets.DISCORD_WEBHOOK_USERNAME }}
